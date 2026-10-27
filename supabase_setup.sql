@@ -171,7 +171,7 @@ begin
   values
     (v_no, v_customer, v_date, v_total, v_requested_paid,
      case when v_requested_paid <= 0 then 'unpaid' when v_requested_paid >= v_total then 'paid_full' else 'dp' end,
-     p_estimate, (select auth.uid()), now(), false)
+     (p_estimate - '_legacy_import'), (select auth.uid()), now(), false)
   on conflict (estimate_number) do update set
     customer_name = excluded.customer_name,
     estimate_date = excluded.estimate_date,
@@ -184,7 +184,11 @@ begin
 
   if v_requested_paid > v_paid_before then
     insert into public.payments (estimate_number, amount, notes, recorded_by)
-    values (v_no, v_requested_paid - v_paid_before, 'Disimpan dari estimasi', (select auth.uid()));
+    values (v_no, v_requested_paid - v_paid_before,
+      case when coalesce((p_estimate->>'_legacy_import')::boolean, false)
+        then 'Saldo awal migrasi localStorage; tanggal transaksi asli tidak tersedia'
+        else 'Disimpan dari estimasi' end,
+      (select auth.uid()));
   end if;
 
   return v_no;
