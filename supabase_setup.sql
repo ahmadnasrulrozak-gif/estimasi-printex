@@ -54,6 +54,8 @@ create table if not exists public.estimate_sequences (
 );
 
 create index if not exists estimates_updated_at_idx on public.estimates(updated_at desc);
+create index if not exists estimates_created_by_idx on public.estimates(created_by);
+create index if not exists payments_recorded_by_idx on public.payments(recorded_by);
 create index if not exists estimates_customer_name_idx on public.estimates using gin (to_tsvector('simple', customer_name));
 create index if not exists payments_estimate_number_idx on public.payments(estimate_number, paid_at desc);
 create index if not exists price_catalog_active_category_idx on public.price_catalog(is_active, category);
@@ -107,12 +109,16 @@ grant select, insert on public.payments to authenticated;
 grant usage, select on sequence public.price_catalog_id_seq to authenticated;
 grant usage, select on sequence public.payments_id_seq to authenticated;
 
-create or replace function public.next_estimate_number(p_date date default current_date)
+create schema if not exists private;
+revoke all on schema private from public, anon, authenticated;
+grant usage on schema private to authenticated;
+
+create or replace function private.next_estimate_number_impl(p_date date)
 returns text
 language plpgsql
 security definer
 set search_path = pg_catalog, public
-as $$
+as $
 declare
   v_prefix text;
   v_max integer := 0;
@@ -126,7 +132,67 @@ begin
 
   v_prefix := 'EST/PRTX/' || to_char(p_date, 'DDMMYY') || '/';
   perform pg_advisory_xact_lock(hashtext('printex-estimate-' || p_date::text));
-  select coalesce(max((regexp_match(estimate_number, '/([0-9]+)$'))[1]::integer), 0)
+  select coalesce(max((regexp_match(estimate_number, '/([0-9]+)
+create or replace function public.save_estimate(p_estimate jsonb)
+returns text
+language plpgsql
+security invoker
+set search_path = ''
+as $$
+declare
+  v_no text;
+  v_customer text;
+  v_date date;
+  v_total numeric(14,2);
+  v_requested_paid numeric(14,2);
+  v_paid_before numeric(14,2);
+begin
+  if auth.uid() is null then raise exception 'Authentication required'; end if;
+  if not exists (
+    select 1 from public.staff_members m where m.user_id = (select auth.uid()) and m.active
+  ) then raise exception 'Active staff membership required'; end if;
+
+  v_no := nullif(p_estimate->>'no', '');
+  if v_no is null then raise exception 'Estimate number is required'; end if;
+  v_customer := coalesce(p_estimate->>'customer', '');
+  v_date := nullif(p_estimate->>'date', '')::date;
+  v_total := greatest(0, coalesce(nullif(p_estimate->>'total', '')::numeric, 0));
+  v_requested_paid := greatest(0, coalesce(nullif(p_estimate->>'paidAmount', '')::numeric, 0));
+
+  select coalesce(sum(p.amount), 0) into v_paid_before
+    from public.payments p where p.estimate_number = v_no;
+
+  if v_requested_paid + 0.005 < v_paid_before then
+    raise exception 'Paid amount cannot be reduced; record a reversal instead';
+  end if;
+
+  insert into public.estimates
+    (estimate_number, customer_name, estimate_date, total, paid_amount, payment_status, data, created_by, updated_at, archived)
+  values
+    (v_no, v_customer, v_date, v_total, v_requested_paid,
+     case when v_requested_paid <= 0 then 'unpaid' when v_requested_paid >= v_total then 'paid_full' else 'dp' end,
+     p_estimate, (select auth.uid()), now(), false)
+  on conflict (estimate_number) do update set
+    customer_name = excluded.customer_name,
+    estimate_date = excluded.estimate_date,
+    total = excluded.total,
+    paid_amount = excluded.paid_amount,
+    payment_status = excluded.payment_status,
+    data = excluded.data,
+    updated_at = now(),
+    archived = false;
+
+  if v_requested_paid > v_paid_before then
+    insert into public.payments (estimate_number, amount, notes, recorded_by)
+    values (v_no, v_requested_paid - v_paid_before, 'Disimpan dari estimasi', (select auth.uid()));
+  end if;
+
+  return v_no;
+end;
+$$;
+revoke all on function public.save_estimate(jsonb) from public;
+grant execute on function public.save_estimate(jsonb) to authenticated;
+))[1]::integer), 0)
     into v_max
     from public.estimates
    where estimate_number like v_prefix || '%';
@@ -139,8 +205,19 @@ begin
 
   return v_prefix || lpad(v_next::text, 4, '0');
 end;
-$$;
-revoke all on function public.next_estimate_number(date) from public;
+$;
+revoke all on function private.next_estimate_number_impl(date) from public, anon;
+grant execute on function private.next_estimate_number_impl(date) to authenticated;
+
+create or replace function public.next_estimate_number(p_date date default current_date)
+returns text
+language sql
+security invoker
+set search_path = ''
+as $
+  select private.next_estimate_number_impl(p_date);
+$;
+revoke all on function public.next_estimate_number(date) from public, anon;
 grant execute on function public.next_estimate_number(date) to authenticated;
 
 create or replace function public.save_estimate(p_estimate jsonb)
