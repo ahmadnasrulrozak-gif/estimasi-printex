@@ -120,8 +120,9 @@ const SUPABASE_PUBLISHABLE_KEY="sb_publishable_kZbYyhvVqItUOkmD3kd-rw_WdDjDaii";
 const supabaseClient=window.supabase?.createClient(SUPABASE_URL,SUPABASE_PUBLISHABLE_KEY)||null;
 let cloudReady=false;
 function authMessage(text){const el=document.getElementById('authError');if(el)el.textContent=text||'';}
-async function saveEstimateCloud(e){
-  const {error}=await supabaseClient.rpc('save_estimate',{p_estimate:e});
+async function saveEstimateCloud(e,legacy=false){
+  const payload=legacy?{...e,_legacy_import:true}:e;
+  const {error}=await supabaseClient.rpc('save_estimate',{p_estimate:payload});
   if(error)throw error;
 }
 async function syncCloudState(){
@@ -132,11 +133,14 @@ async function syncCloudState(){
   const remoteByNumber=new Map((remoteEstimates||[]).map(x=>[x.estimate_number,x.data]));
   const conflicts=localEstimates.filter(x=>x?.no&&remoteByNumber.has(x.no)&&JSON.stringify(remoteByNumber.get(x.no))!==JSON.stringify(x));
   if(conflicts.length)localStorage.setItem('prx_estimates_conflict_backup',JSON.stringify(conflicts));
-  for(const legacy of localEstimates){if(legacy?.no&&!remoteNumbers.has(legacy.no)){try{await saveEstimateCloud(legacy);remoteNumbers.add(legacy.no);}catch(e){console.warn('Legacy estimate import skipped',legacy.no,e);}}}
+  const unimported=[];
+  for(const legacy of localEstimates){if(legacy?.no&&!remoteNumbers.has(legacy.no)){try{await saveEstimateCloud(legacy,true);remoteNumbers.add(legacy.no);}catch(e){unimported.push(legacy);console.warn('Legacy estimate import skipped',legacy.no,e);}}}
   const {data:allEstimates,error:reloadError}=await supabaseClient.from('estimates').select('estimate_number,data,archived').eq('archived',false).order('updated_at',{ascending:false});
   if(reloadError)throw reloadError;
   const merged=(allEstimates||[]).map(x=>x.data).filter(x=>x&&x.no);
+  for(const item of unimported){if(!merged.some(x=>x.no===item.no))merged.unshift(item);}
   localStorage.setItem('prx_estimates',JSON.stringify(merged));
+  if(unimported.length)lekNotice(unimported.length+' estimasi belum terkirim. Salinan lokal tetap disimpan dan akan dicoba lagi saat sinkronisasi berikutnya.');
   if(conflicts.length)lekNotice(conflicts.length+' estimasi lokal memiliki nomor yang sama dengan data server. Salinan lokal aman disimpan di browser untuk ditinjau.');
   const {data:remoteCatalog,error:catalogError}=await supabaseClient.from('price_catalog').select('category,name,price,unit,is_active').eq('is_active',true).order('category').order('name');
   if(catalogError)throw catalogError;
