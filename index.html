@@ -121,6 +121,9 @@ const SUPABASE_URL="https://zflhnphhyjdwjxjlwymx.supabase.co";
 const SUPABASE_PUBLISHABLE_KEY="sb_publishable_kZbYyhvVqItUOkmD3kd-rw_WdDjDaii";
 const supabaseClient=window.supabase?.createClient(SUPABASE_URL,SUPABASE_PUBLISHABLE_KEY)||null;
 let cloudReady=false;
+let catalogRealtimeChannel=null;
+let catalogRefreshTimer=null;
+let catalogRefreshInFlight=false;
 function authMessage(text){const el=document.getElementById('authError');if(el)el.textContent=text||'';}
 async function saveEstimateCloud(e,legacy=false){
   const payload=legacy?{...e,_legacy_import:true}:e;
@@ -169,7 +172,7 @@ async function initSupabaseConnection(){
   if(!session){gate.hidden=false;return;}
   const {data:member,error}=await supabaseClient.from('staff_members').select('user_id').eq('user_id',session.user.id).eq('active',true).maybeSingle();
   if(error||!member){await supabaseClient.auth.signOut();gate.hidden=false;authMessage('Akun ini belum terdaftar sebagai staf Printex.');return;}
-  try{cloudReady=true;await syncCloudState();gate.hidden=true;logout.style.display='block';
+  try{cloudReady=true;await syncCloudState();subscribeCatalogRealtime();gate.hidden=true;logout.style.display='block';
     const {data:numberData,error:numberError}=await supabaseClient.rpc('next_estimate_number',{p_date:document.getElementById('invDate').value||dateISO()});
     if(!numberError&&numberData)document.getElementById('invNo').value=numberData;
   }catch(e){cloudReady=false;gate.hidden=false;authMessage('Koneksi database gagal: '+(e.message||e));}
@@ -228,7 +231,7 @@ function loadCatalog(){
     return normalized;
   }catch(e){return INITIAL_CATALOG.map(x=>({...x}));}
 }
-function persistCatalog(){localStorage.setItem('prx_catalog',JSON.stringify(catalog));if(cloudReady)void syncCatalogCloud();}
+function persistCatalog(){localStorage.setItem('prx_catalog',JSON.stringify(catalog));if(cloudReady)void syncCatalogCloud().catch(e=>lekNotice('Katalog tersimpan di perangkat ini, tetapi gagal dikirim ke database: '+(e.message||e)));}
 async function syncCatalogCloud(){
  const {data:active,error:readError}=await supabaseClient.from('price_catalog').select('category,name').eq('is_active',true);
  if(readError)throw readError;
@@ -237,6 +240,28 @@ async function syncCatalogCloud(){
  const values=catalog.map(({category,name,price,unit})=>({category,name,price,unit,is_active:true}));
  const {error}=await supabaseClient.from('price_catalog').upsert(values,{onConflict:'category,name'});
  if(error)throw error;
+}
+async function refreshCatalogFromCloud(){
+ if(!cloudReady||catalogRefreshInFlight)return;
+ catalogRefreshInFlight=true;
+ try{
+  const {data,error}=await supabaseClient.from('price_catalog').select('category,name,price,unit').eq('is_active',true).order('category').order('name');
+  if(error)throw error;
+  catalog=(data||[]).map(x=>({category:x.category,name:x.name,price:Number(x.price),unit:x.unit}));
+  localStorage.setItem('prx_catalog',JSON.stringify(catalog));
+  renderCatalog();renderRows();searchEstimateItems();
+ }finally{catalogRefreshInFlight=false;}
+}
+function subscribeCatalogRealtime(){
+ if(!cloudReady||catalogRealtimeChannel)return;
+ catalogRealtimeChannel=supabaseClient.channel('prx-price-catalog')
+  .on('postgres_changes',{event:'*',schema:'public',table:'price_catalog'},()=>{
+   clearTimeout(catalogRefreshTimer);
+   catalogRefreshTimer=setTimeout(()=>refreshCatalogFromCloud().catch(e=>console.warn('Realtime katalog gagal dimuat',e)),250);
+  })
+  .subscribe(status=>{
+   if(status==='SUBSCRIBED')refreshCatalogFromCloud().catch(e=>console.warn('Refresh katalog gagal',e));
+  });
 }
 const rupiah=n=>'Rp'+Math.round(Number(n)||0).toLocaleString('id-ID');
 const num=v=>Math.max(0,Number(v)||0);
