@@ -124,6 +124,7 @@ let cloudReady=false;
 let catalogRealtimeChannel=null;
 let catalogRefreshTimer=null;
 let catalogRefreshInFlight=false;
+let catalogRefreshPending=false;
 function authMessage(text){const el=document.getElementById('authError');if(el)el.textContent=text||'';}
 async function saveEstimateCloud(e,legacy=false){
   const payload=legacy?{...e,_legacy_import:true}:e;
@@ -147,19 +148,15 @@ async function syncCloudState(){
   localStorage.setItem('prx_estimates',JSON.stringify(merged));
   if(unimported.length)lekNotice(unimported.length+' estimasi belum terkirim. Salinan lokal tetap disimpan dan akan dicoba lagi saat sinkronisasi berikutnya.');
   if(conflicts.length)lekNotice(conflicts.length+' estimasi lokal memiliki nomor yang sama dengan data server. Salinan lokal aman disimpan di browser untuk ditinjau.');
-  const {data:remoteCatalog,error:catalogError}=await supabaseClient.from('price_catalog').select('category,name,price,unit,is_active').eq('is_active',true).order('category').order('name');
+  const {data:remoteCatalog,error:catalogError}=await supabaseClient.from('price_catalog').select('category,name,price,unit,is_active').order('category').order('name');
   if(catalogError)throw catalogError;
   if(!remoteCatalog?.length){
     const seed=(catalog||[]).map(({category,name,price,unit})=>({category,name,price,unit,is_active:true}));
     if(seed.length){const {error}=await supabaseClient.from('price_catalog').upsert(seed,{onConflict:'category,name'});if(error)throw error;}
+    catalog=seed.map(({category,name,price,unit})=>({category,name,price:Number(price),unit}));
   }else{
-    const have=new Set(remoteCatalog.map(x=>x.category+'\u0000'+x.name));
-    const extras=(catalog||[]).filter(x=>!have.has(x.category+'\u0000'+x.name)).map(({category,name,price,unit})=>({category,name,price,unit,is_active:true}));
-    if(extras.length){const {error}=await supabaseClient.from('price_catalog').upsert(extras,{onConflict:'category,name'});if(error)throw error;}
+    catalog=remoteCatalog.filter(x=>x.is_active).map(x=>({category:x.category,name:x.name,price:Number(x.price),unit:x.unit}));
   }
-  const {data:catalogRows,error:catalogReloadError}=await supabaseClient.from('price_catalog').select('category,name,price,unit').eq('is_active',true).order('category').order('name');
-  if(catalogReloadError)throw catalogReloadError;
-  catalog=(catalogRows||[]).map(x=>({category:x.category,name:x.name,price:Number(x.price),unit:x.unit}));
   const normalizedEstimates=merged.map(e=>({...e,rows:(e.rows||[]).map(r=>{const idx=catalog.findIndex(c=>c.name===r.name&&c.category===r.category);return {...r,catIndex:idx,custom:idx<0?true:!!r.custom};})}));
   localStorage.setItem('prx_estimates',JSON.stringify(normalizedEstimates));
   localStorage.setItem('prx_catalog',JSON.stringify(catalog));
@@ -231,18 +228,26 @@ function loadCatalog(){
     return normalized;
   }catch(e){return INITIAL_CATALOG.map(x=>({...x}));}
 }
-function persistCatalog(){localStorage.setItem('prx_catalog',JSON.stringify(catalog));if(cloudReady)void syncCatalogCloud().catch(e=>lekNotice('Katalog tersimpan di perangkat ini, tetapi gagal dikirim ke database: '+(e.message||e)));}
-async function syncCatalogCloud(){
- const {data:active,error:readError}=await supabaseClient.from('price_catalog').select('category,name').eq('is_active',true);
- if(readError)throw readError;
- const keep=new Set(catalog.map(x=>JSON.stringify([x.category,x.name])));
- for(const item of (active||[])){if(!keep.has(JSON.stringify([item.category,item.name]))){const {error}=await supabaseClient.from('price_catalog').update({is_active:false}).eq('category',item.category).eq('name',item.name);if(error)throw error;}}
- const values=catalog.map(({category,name,price,unit})=>({category,name,price,unit,is_active:true}));
- const {error}=await supabaseClient.from('price_catalog').upsert(values,{onConflict:'category,name'});
- if(error)throw error;
+function persistCatalog(previous){
+ localStorage.setItem('prx_catalog',JSON.stringify(catalog));
+ if(!cloudReady||!previous)return;
+ const key=x=>JSON.stringify([x.category,x.name]);
+ const before=new Map(previous.map(x=>[key(x),x]));
+ const after=new Map(catalog.map(x=>[key(x),x]));
+ const writes=[
+  ...previous.filter(x=>!after.has(key(x))).map(x=>
+   supabaseClient.from('price_catalog').update({is_active:false}).eq('category',x.category).eq('name',x.name)),
+  ...catalog.filter(x=>JSON.stringify(x)!==JSON.stringify(before.get(key(x)))).map(x=>
+   supabaseClient.from('price_catalog').upsert({...x,is_active:true},{onConflict:'category,name'}))
+ ];
+ void Promise.all(writes).then(results=>{
+  const failed=results.find(r=>r.error);
+  if(failed)throw failed.error;
+ }).catch(e=>lekNotice('Katalog tersimpan di perangkat ini, tetapi gagal dikirim ke database: '+(e.message||e)));
 }
 async function refreshCatalogFromCloud(){
- if(!cloudReady||catalogRefreshInFlight)return;
+ if(!cloudReady)return;
+ if(catalogRefreshInFlight){catalogRefreshPending=true;return;}
  catalogRefreshInFlight=true;
  try{
   const {data,error}=await supabaseClient.from('price_catalog').select('category,name,price,unit').eq('is_active',true).order('category').order('name');
@@ -250,7 +255,10 @@ async function refreshCatalogFromCloud(){
   catalog=(data||[]).map(x=>({category:x.category,name:x.name,price:Number(x.price),unit:x.unit}));
   localStorage.setItem('prx_catalog',JSON.stringify(catalog));
   renderCatalog();renderRows();searchEstimateItems();
- }finally{catalogRefreshInFlight=false;}
+ }finally{
+  catalogRefreshInFlight=false;
+  if(catalogRefreshPending){catalogRefreshPending=false;void refreshCatalogFromCloud().catch(e=>console.warn('Realtime katalog gagal dimuat',e));}
+ }
 }
 function subscribeCatalogRealtime(){
  if(!cloudReady||catalogRealtimeChannel)return;
@@ -405,12 +413,12 @@ function updateSavedPaymentPreview(i,total){const status=document.getElementById
 async function saveSavedPayment(i){let list=JSON.parse(localStorage.getItem('prx_estimates')||'[]');if(!list[i])return;const total=num(list[i].total),previous=Math.max(0,num(list[i].paidAmount??list[i].deposit??0));let amount=Math.max(0,num(document.getElementById('saved-pay-amount-'+i).value));amount=Math.min(amount,total);if(amount<previous){lekNotice('Pembayaran tersimpan sebagai riwayat dan tidak dapat dikurangi. Catat koreksi sebagai transaksi terpisah.');return;}let status=amount<=0?'unpaid':(amount>=total?'paid_full':'dp');list[i].paymentStatus=status;list[i].paidAmount=amount;list[i].deposit=amount;list[i].paymentUpdatedAt=new Date().toISOString();localStorage.setItem('prx_estimates',JSON.stringify(list));try{if(cloudReady)await saveEstimateCloud(list[i]);}catch(e){lekNotice('Perubahan pembayaran tersimpan lokal, sinkronisasi gagal: '+e.message);return;}renderSaved();lekNotice('Pembayaran berhasil dicatat. Riwayat transaksi tersimpan.');}function printSavedEstimate(no){const list=JSON.parse(localStorage.getItem('prx_estimates')||'[]'),e=list.find(x=>x.no===no);if(!e)return;loadEstimate(no);const paid=Math.max(0,num(e.paidAmount??e.deposit??0));document.getElementById('deposit').value=paid;document.getElementById('paidAmount').value=paid;document.getElementById('paymentStatus').value=paid<=0?'unpaid':(paid>=num(e.total)?'paid_full':'dp');renderTotals();syncPrint();window.print();}function showSaved(){renderSaved();document.getElementById('savedList').scrollIntoView({behavior:'smooth',block:'center'});}
 function loadEstimate(no){let list=JSON.parse(localStorage.getItem('prx_estimates')||'[]'),e=list.find(x=>x.no===no);if(!e)return;['no','date','validUntil','customer','admin','notes'].forEach(k=>{let id=({no:'invNo',date:'invDate',validUntil:'validUntil',customer:'customer',admin:'admin',notes:'notes'})[k];document.getElementById(id).value=(k==='admin'?({'CS 1 ALIF':'Customer Service 1','CS 2 Yoko':'Customer Service 2','Design 1 Nasrul':'Designer 1'}[e[k]]||e[k]||''):(e[k]||''))});try{if(e.admin)localStorage.setItem('prx_last_admin',e.admin);}catch(err){}rows=(e.rows||[]).map(r=>({...r,id:++rowId}));document.getElementById('discount').value=e.discount||0;document.getElementById('deposit').value=Math.max(0,num(e.paidAmount??e.deposit??0));document.getElementById('paymentStatus').value=(num(e.paidAmount??e.deposit??0)<=0?'unpaid':(num(e.paidAmount??e.deposit??0)>=num(e.total)?'paid_full':'dp'));document.getElementById('paidAmount').value=Math.max(0,num(e.paidAmount??e.deposit??0));renderRows();updatePaymentPercent();syncPrint();renderSaved();showPage('quote');}
 async function deleteEstimate(no){if(!(await lekConfirm('Arsipkan estimasi '+no+'? Riwayat pembayaran tetap disimpan.')))return;if(cloudReady){const {error}=await supabaseClient.from('estimates').update({archived:true}).eq('estimate_number',no);if(error){lekNotice('Gagal mengarsipkan estimasi: '+error.message);return;}}localStorage.setItem('prx_estimates',JSON.stringify(JSON.parse(localStorage.getItem('prx_estimates')||'[]').filter(e=>e.no!==no)));renderSaved();}async function newEstimate(){if(!(await lekConfirm('Mulai estimasi baru? Pastikan estimasi sekarang sudah disimpan jika diperlukan.')))return;document.getElementById('invDate').value=dateISO();document.getElementById('invNo').value=nextNo(document.getElementById('invDate').value);if(cloudReady){const {data,error}=await supabaseClient.rpc('next_estimate_number',{p_date:document.getElementById('invDate').value});if(!error&&data)document.getElementById('invNo').value=data;}let d=new Date();d.setDate(d.getDate()+7);document.getElementById('validUntil').value=dateISO(d);['customer','notes'].forEach(id=>document.getElementById(id).value='');document.getElementById('discount').value=0;document.getElementById('deposit').value=0;document.getElementById('paymentStatus').value='unpaid';document.getElementById('paidAmount').value=0;rows=[];addRow();renderTotals();updatePaymentPercent();}function renderCatalog(){let q=(document.getElementById('catalogSearch')?.value||'').toLowerCase(),el=document.getElementById('catalogList');if(!el)return;el.innerHTML=catalog.map((x,i)=>({...x,i})).filter(x=>(x.name+' '+x.category).toLowerCase().includes(q)).map(x=>`<div class="catalogrow"><div class="catname">${escapeHTML(x.name)}<small>${escapeHTML(x.category)}</small></div><input aria-label="Harga ${escapeHTML(x.name)}" type="number" min="0" value="${x.price}" onchange="editCatalog(${x.i},'price',this.value)"><select onchange="editCatalog(${x.i},'unit',this.value)">${['meter','pcs','set','jasa','roll','kg'].map(u=>`<option ${x.unit===u?'selected':''}>${u}</option>`).join('')}</select><button class="btn danger small" onclick="removeCatalog(${x.i})">×</button></div>`).join('')||'<p class="sub">Item tidak ditemukan.</p>';}
-function editCatalog(i,k,v){catalog[i][k]=k==='price'?num(v):v;persistCatalog();renderCatalog();}
-function addCatalogItem(){let name=prompt('Nama item katalog:');if(!name)return;let category=prompt('Kategori:', 'Custom')||'Custom';let price=num(prompt('Harga satuan (Rp):','0'));let unit=prompt('Satuan (meter/pcs/set/jasa):','pcs')||'pcs';catalog.push({name,category,price,unit});persistCatalog();renderCatalog();}
-async function removeCatalog(i){if(!(await lekConfirm('Hapus item katalog ini?')))return;catalog.splice(i,1);persistCatalog();renderCatalog();}
-async function resetCatalog(){if(!(await lekConfirm('Kembalikan katalog ke data awal dari Excel?')))return;catalog=INITIAL_CATALOG.map(x=>({...x}));persistCatalog();renderCatalog();}
+function editCatalog(i,k,v){const previous=catalog.map(x=>({...x}));catalog[i][k]=k==='price'?num(v):v;persistCatalog(previous);renderCatalog();}
+function addCatalogItem(){let name=prompt('Nama item katalog:');if(!name)return;let category=prompt('Kategori:', 'Custom')||'Custom';let price=num(prompt('Harga satuan (Rp):','0'));let unit=prompt('Satuan (meter/pcs/set/jasa):','pcs')||'pcs';const previous=catalog.map(x=>({...x}));catalog.push({name,category,price,unit});persistCatalog(previous);renderCatalog();}
+async function removeCatalog(i){if(!(await lekConfirm('Hapus item katalog ini?')))return;const previous=catalog.map(x=>({...x}));catalog.splice(i,1);persistCatalog(previous);renderCatalog();}
+async function resetCatalog(){if(!(await lekConfirm('Kembalikan katalog ke data awal dari Excel?')))return;const previous=catalog.map(x=>({...x}));catalog=INITIAL_CATALOG.map(x=>({...x}));persistCatalog(previous);renderCatalog();}
 function exportCatalog(){let blob=new Blob([JSON.stringify(catalog,null,2)],{type:'application/json'}),a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='printex-katalog-harga.json';a.click();URL.revokeObjectURL(a.href);}
-function importCatalog(ev){let f=ev.target.files[0];if(!f)return;let rd=new FileReader();rd.onload=async()=>{try{let v=JSON.parse(rd.result);if(!Array.isArray(v)||!v.every(x=>x.name&&x.category&&x.unit!==undefined))throw Error();catalog=v.map(x=>({name:String(x.name),category:String(x.category),price:num(x.price),unit:String(x.unit)}));persistCatalog();renderCatalog();lekNotice('Katalog berhasil diimpor.');}catch(e){lekNotice('File JSON tidak sesuai format katalog.');}};rd.readAsText(f);}
+function importCatalog(ev){let f=ev.target.files[0];if(!f)return;let rd=new FileReader();rd.onload=async()=>{try{let v=JSON.parse(rd.result);if(!Array.isArray(v)||!v.every(x=>x.name&&x.category&&x.unit!==undefined))throw Error();const previous=catalog.map(x=>({...x}));catalog=v.map(x=>({name:String(x.name),category:String(x.category),price:num(x.price),unit:String(x.unit)}));persistCatalog(previous);renderCatalog();lekNotice('Katalog berhasil diimpor.');}catch(e){lekNotice('File JSON tidak sesuai format katalog.');}};rd.readAsText(f);}
 let printLayoutPositions=[];
 function arrangePrintLayout(){
  const q=document.getElementById('quotePage');
